@@ -1,26 +1,82 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import Anthropic from "@anthropic-ai/sdk";
+import fs from "fs";
+import dotenv from "dotenv";
 
-// Create the server
+dotenv.config();
+
+const client = new Anthropic();
+
+// Load the embeddings we created with embed.js
+const embeddings = JSON.parse(fs.readFileSync("./embeddings.json", "utf-8"));
+
+// Convert a query to a vector using Claude
+async function embedQuery(query) {
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: `Convert this text to a search embedding. Respond with ONLY a JSON array of 16 numbers between -1 and 1 that represent the semantic meaning of this text. No explanation, just the array.
+        
+Text: ${query}`,
+      },
+    ],
+  });
+
+  return JSON.parse(response.content[0].text.trim());
+}
+
+// Calculate how similar two vectors are
+function cosineSimilarity(vecA, vecB) {
+  const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
+  const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
+  const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+  return dotProduct / (magnitudeA * magnitudeB);
+}
+
+// Find the most relevant doc chunks for a query
+async function searchDocs(query, topK = 3) {
+  const queryVector = await embedQuery(query);
+
+  // Score every chunk against the query
+  const scored = embeddings.map((doc) => ({
+    filename: doc.filename,
+    text: doc.text,
+    score: cosineSimilarity(queryVector, doc.vector),
+  }));
+
+  // Sort by score and return the top results
+  return scored.sort((a, b) => b.score - a.score).slice(0, topK);
+}
+
+// Create the MCP server
 const server = new McpServer({
   name: "ai-docs-assistant",
   version: "1.0.0",
 });
 
-// Define our first tool
+// Define the search_docs tool
 server.tool(
-  "search_docs",                           // tool name
-  "searches the documentation for a given query", // description the AI reads
-  { query: z.string() },                   // input schema - expects a string called query
+  "search_docs",
+  "searches the internal documentation for a given query and returns the most relevant sections",
+  { query: z.string() },
   async ({ query }) => {
-    // For now we're just returning fake data
-    // Later this will actually search our docs
+    console.error(`Searching for: "${query}"`);
+    const results = await searchDocs(query);
+
+    const formatted = results
+      .map((r) => `[${r.filename}] (score: ${r.score.toFixed(2)})\n${r.text}`)
+      .join("\n\n---\n\n");
+
     return {
       content: [
         {
           type: "text",
-          text: `Here are the results for: "${query}". (This is a placeholder - real search coming soon!)`,
+          text: formatted,
         },
       ],
     };
